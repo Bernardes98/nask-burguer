@@ -14,3 +14,6 @@ body{overflow-x:clip}
 .hero-copy>p{max-width:510px}
 .hero-visual{display:none}
 @media(max-width:760px){.hero{width:100vw;min-height:calc(100svh - 65px);margin-left:calc(50% - 50vw);padding:44px 22px}.hero::before{background:linear-gradient(90deg,rgba(10,11,12,.88),rgba(10,11,12,.48)),linear-gradient(0deg,#101112 0%,transparent 25%,rgba(16,17,18,.14) 100%),url('/images/burger-ragu.jpg') 56% center/cover no-repeat}.hero h1{font-size:clamp(50px,11vw,74px)}.hero-copy>p{font-size:12px;max-width:400px}.hero-actions{flex-wrap:wrap}}
+html{scroll-padding-top:104px}
+#cardapio,#sobre,#contato{scroll-margin-top:104px}
+@media(max-width:760px){html{scroll-padding-top:88px}#cardapio,#sobre,#contato{scroll-margin-top:88px}}
