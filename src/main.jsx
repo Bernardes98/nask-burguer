@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import { supabase } from './lib/supabase.js';
 import './style.css';
 
 const initialProducts = [
@@ -17,6 +18,7 @@ const demoOrders = [
   { id: 2039, client: 'Rafa P.', address: 'Av. Independência, 890 · Independência', total: 39.9, status: 'Em preparo', lat: 72, left: 36 },
 ];
 const money = v => v.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+const fromDatabaseProduct = row => ({ ...row, price: Number(row.price), image: row.image_url || '/images/burger-classic.jpg', active: row.active !== false });
 
 function App() {
   const [products, setProducts] = useState(() => {
@@ -39,6 +41,9 @@ function App() {
   const [payment, setPayment] = useState('Pix');
   const [editing, setEditing] = useState(null);
   const [toast, setToast] = useState('');
+  const [adminUser, setAdminUser] = useState(null);
+  const [showAdminLogin, setShowAdminLogin] = useState(false);
+  const [dataMode, setDataMode] = useState(supabase ? 'loading' : 'local');
 
   const cats = ['Todos', ...new Set(products.filter(p => p.active).map(p => p.category))];
   const visible = products.filter(p => p.active && (category === 'Todos' || p.category === category));
@@ -47,7 +52,26 @@ function App() {
   const delivery = orderType === 'Delivery' && cart.length ? 5.9 : 0;
   const total = subtotal + delivery;
 
-  useEffect(() => { localStorage.setItem('nask-demo-products', JSON.stringify(products)); }, [products]);
+  useEffect(() => {
+    if (!supabase) {
+      localStorage.setItem('nask-demo-products', JSON.stringify(products));
+      return;
+    }
+    let mounted = true;
+    (async () => {
+      const { data, error } = await supabase.from('products').select('*').eq('active', true).order('sort_order').order('created_at');
+      if (!mounted) return;
+      if (error) {
+        setDataMode('error');
+        setToast('Não foi possível carregar o cardápio do Supabase. Confira a configuração do banco.');
+        setTimeout(() => setToast(''), 5000);
+        return;
+      }
+      setProducts(data.map(fromDatabaseProduct));
+      setDataMode('supabase');
+    })();
+    return () => { mounted = false; };
+  }, []);
 
   function openProduct(product) { setSelected(product); setExtraNames([]); setRemoved([]); setNotes(''); }
   function addConfigured() {
@@ -58,10 +82,52 @@ function App() {
   }
   function changeQty(key, delta) { setCart(c => c.map(x => x.key === key ? { ...x, qty: x.qty + delta } : x).filter(x => x.qty > 0)); }
   function finishOrder(e) { e.preventDefault(); setSuccess(true); setCheckout(false); setShowCart(false); setCart([]); }
-  function saveProduct(e) {
+  async function openAdmin() {
+    setAdminTab('Visão geral');
+    if (supabase) { setShowAdminLogin(true); return; }
+    setView('admin');
+  }
+  async function signInAdmin(e) {
+    e.preventDefault();
+    const form = new FormData(e.currentTarget);
+    const { data, error } = await supabase.auth.signInWithPassword({ email: form.get('email'), password: form.get('password') });
+    if (error) { setToast('Não foi possível entrar. Confira e-mail e senha.'); setTimeout(() => setToast(''), 3000); return; }
+    const { data: membership, error: membershipError } = await supabase.from('store_admins').select('user_id').eq('user_id', data.user.id).maybeSingle();
+    if (membershipError || !membership) {
+      await supabase.auth.signOut();
+      setToast('Este usuário não tem acesso ao painel da loja.'); setTimeout(() => setToast(''), 3500); return;
+    }
+    setAdminUser(data.user);
+    const { data: rows, error: productsError } = await supabase.from('products').select('*').order('sort_order').order('created_at');
+    if (!productsError) setProducts(rows.map(fromDatabaseProduct));
+    setShowAdminLogin(false); setView('admin');
+  }
+  async function logoutAdmin() {
+    await supabase?.auth.signOut(); setAdminUser(null); setView('shop');
+  }
+  async function toggleProduct(product) {
+    const active = !product.active;
+    if (supabase && adminUser) {
+      const { error } = await supabase.from('products').update({ active }).eq('id', product.id);
+      if (error) { setToast('Não foi possível atualizar o produto no Supabase.'); setTimeout(() => setToast(''), 3000); return; }
+    }
+    setProducts(list => list.map(p => p.id === product.id ? { ...p, active } : p));
+  }
+  async function saveProduct(e) {
     e.preventDefault(); const f = new FormData(e.currentTarget);
-    const item = { id: editing?.id || Date.now(), name: f.get('name'), category: f.get('category'), price: Number(f.get('price')), description: f.get('description'), image: editing?.image || '/images/burger-classic.jpg', tag: editing?.tag || '', active: true };
-    setProducts(list => editing ? list.map(p => p.id === item.id ? item : p) : [...list, item]); setEditing(null); setToast('Produto salvo nesta demonstração'); setTimeout(() => setToast(''), 2400);
+    const item = { id: editing?.id || Date.now(), name: f.get('name'), category: f.get('category'), price: Number(f.get('price')), description: f.get('description'), image: f.get('image') || '/images/burger-classic.jpg', tag: editing?.tag || '', active: true };
+    if (supabase && adminUser) {
+      const payload = { name: item.name, category: item.category, price: item.price, description: item.description, image_url: item.image, tag: item.tag, active: item.active };
+      const { data, error } = editing?.id
+        ? await supabase.from('products').update(payload).eq('id', editing.id).select().single()
+        : await supabase.from('products').insert(payload).select().single();
+      if (error) { setToast('Não foi possível salvar no Supabase. Confira sua conexão e permissões.'); setTimeout(() => setToast(''), 3500); return; }
+      const saved = fromDatabaseProduct(data);
+      setProducts(list => editing?.id ? list.map(p => p.id === saved.id ? saved : p) : [...list, saved]);
+    } else {
+      setProducts(list => editing?.id ? list.map(p => p.id === item.id ? item : p) : [...list, item]);
+    }
+    setEditing(null); setToast(supabase ? 'Produto salvo no Supabase' : 'Produto salvo neste navegador'); setTimeout(() => setToast(''), 2400);
   }
 
   return <>
@@ -69,7 +135,7 @@ function App() {
     {view === 'shop' ? <>
       <header className="topbar"><div className="container nav">
         <a className="brand" href="#top"><img src="/images/nask-logo.jpg"/><span><b>nask burguer</b><small>HAMBURGUERIA · PORTO ALEGRE</small></span></a>
-        <nav><a href="#cardapio">Cardápio</a><a href="#sobre">A Nask</a><a href="#contato">Contato</a><button className="link-btn" onClick={() => {setView('admin');setAdminTab('Visão geral')}}>Área da loja ↗</button></nav>
+        <nav><a href="#cardapio">Cardápio</a><a href="#sobre">A Nask</a><a href="#contato">Contato</a><button className="link-btn" onClick={openAdmin}>Área da loja ↗</button></nav>
         <button className="cart-button" onClick={() => setShowCart(true)}>Sacola <span>{cartCount}</span></button>
       </div></header>
       <main id="top" className="container">
@@ -82,26 +148,27 @@ function App() {
         <section className="trust-row"><div>🔥 <b>Feito na hora</b><small>Ingredientes frescos</small></div><div>📍 <b>Porto Alegre</b><small>Delivery e retirada</small></div><div>💳 <b>Pagamento fácil</b><small>Pix ou na entrega</small></div></section>
         <footer id="contato"><div className="brand"><img src="/images/nask-logo.jpg"/><span><b>nask burguer</b><small>Se tu não provou, tu não viveu.</small></span></div><div>Domingo 18h30–22h · Terça a sábado 18h30–23h<br/><a href="https://wa.me/5551994477357" target="_blank" rel="noreferrer">WhatsApp comercial ↗</a></div><small>© 2026 Nask Burguer · Demonstração de portfólio</small></footer>
       </main>
-    </> : <Admin products={products} setProducts={setProducts} tab={adminTab} setTab={setAdminTab} back={()=>setView('shop')} orders={demoOrders} onEdit={p=>setEditing(p)} onNew={()=>setEditing({})}/>}
+    </> : <Admin products={products} tab={adminTab} setTab={setAdminTab} back={()=>setView('shop')} orders={demoOrders} onEdit={p=>setEditing(p)} onNew={()=>setEditing({})} onToggle={toggleProduct} adminUser={adminUser} onLogout={logoutAdmin} dataMode={dataMode}/>}
 
     {selected && <div className="overlay" onClick={()=>setSelected(null)}><div className="modal product-modal" onClick={e=>e.stopPropagation()}><button className="close" onClick={()=>setSelected(null)}>×</button><img className="modal-photo" src={selected.image}/><div className="modal-content"><small className="eyebrow">{selected.category}</small><h2>{selected.name}</h2><p>{selected.description}</p><div className="choice-title">Quer adicionar algo?</div>{extras.map(x=><label className="choice" key={x.name}><span>{x.name}<small>+ {money(x.price)}</small></span><input type="checkbox" checked={extraNames.includes(x.name)} onChange={e=>setExtraNames(a=>e.target.checked?[...a,x.name]:a.filter(n=>n!==x.name))}/></label>)}<div className="choice-title">Quer remover algum ingrediente?</div><div className="remove-list">{['Queijo','Cebola','Picles','Molho da casa','Alface'].map(x=><label key={x}><input type="checkbox" checked={removed.includes(x)} onChange={e=>setRemoved(a=>e.target.checked?[...a,x]:a.filter(n=>n!==x))}/>{x}</label>)}</div><label className="notes-label">Observações<textarea placeholder="Ex.: ponto da carne, alergia..." value={notes} onChange={e=>setNotes(e.target.value)} maxLength={180}/></label><button className="primary wide" onClick={addConfigured}>Adicionar à sacola · {money(selected.price+extras.filter(x=>extraNames.includes(x.name)).reduce((n,x)=>n+x.price,0))}</button></div></div></div>}
     {showCart && <div className="overlay" onClick={()=>setShowCart(false)}><aside className="drawer" onClick={e=>e.stopPropagation()}><div className="drawer-head"><div><small className="eyebrow">Seu pedido</small><h2>Sacola <span>({cartCount})</span></h2></div><button className="close" onClick={()=>setShowCart(false)}>×</button></div>{cart.length===0?<div className="empty">Sua sacola ainda está vazia.<button className="primary" onClick={()=>setShowCart(false)}>Escolher meu lanche</button></div>:<><div className="cart-items">{cart.map(row=><div className="cart-row" key={row.key}><img src={row.product.image}/><div className="cart-description"><b>{row.product.name}</b><small>{row.additions.length?`+ ${row.additions.join(', ')}`:'Personalizado'}{row.removed.length?` · sem ${row.removed.join(', ')}`:''}</small>{row.notes&&<small>Obs.: {row.notes}</small>}<strong>{money(row.price*row.qty)}</strong></div><div className="qty"><button onClick={()=>changeQty(row.key,-1)}>−</button>{row.qty}<button onClick={()=>changeQty(row.key,1)}>+</button></div></div>)}<button className="suggestion" onClick={()=>{setShowCart(false);openProduct(products.find(p=>p.name==='Batata Nask'))}}><span>🍟</span><span><b>Combina com teu pedido</b><small>Batata Nask · R$ 15,90</small></span><strong>Adicionar +</strong></button></div><div className="cart-foot"><div className="cart-line"><span>Subtotal</span><b>{money(subtotal)}</b></div><div className="cart-line"><span>Entrega estimada</span><b>{money(delivery)}</b></div><div className="cart-line total"><span>Total</span><b>{money(total)}</b></div><button className="primary wide" onClick={()=>{setShowCart(false);setCheckout(true)}}>Continuar para entrega</button></div></>}</aside></div>}
     {checkout && <div className="overlay" onClick={()=>setCheckout(false)}><div className="modal checkout-modal" onClick={e=>e.stopPropagation()}><button className="close" onClick={()=>setCheckout(false)}>×</button><small className="eyebrow">Quase lá</small><h2>Finalizar pedido</h2><div className="order-switch"><button className={orderType==='Delivery'?'selected':''} onClick={()=>setOrderType('Delivery')}>🛵 Delivery</button><button className={orderType==='Retirada'?'selected':''} onClick={()=>setOrderType('Retirada')}>🛍️ Retirada</button></div><form onSubmit={finishOrder}><div className="fields"><label>Seu nome<input required value={address.name} onChange={e=>setAddress({...address,name:e.target.value})} placeholder="Como podemos te chamar?"/></label><label>WhatsApp<input required value={address.phone} onChange={e=>setAddress({...address,phone:e.target.value})} placeholder="(51) 99999-9999"/></label>{orderType==='Delivery'&&<><label className="full">Endereço<input required value={address.street} onChange={e=>setAddress({...address,street:e.target.value})} placeholder="Rua, avenida..."/></label><label>Número<input required value={address.number} onChange={e=>setAddress({...address,number:e.target.value})}/></label><label>Bairro<input required value={address.neighborhood} onChange={e=>setAddress({...address,neighborhood:e.target.value})}/></label><label className="full">Complemento<input value={address.complement} onChange={e=>setAddress({...address,complement:e.target.value})} placeholder="Apto, referência (opcional)"/></label></>}</div><div className="choice-title">Forma de pagamento</div><div className="pay-options">{['Pix','Cartão na entrega','Dinheiro'].map(x=><button type="button" className={payment===x?'selected':''} onClick={()=>setPayment(x)} key={x}>{x}</button>)}</div><div className="checkout-total"><span>Total demonstrativo</span><b>{money(total)}</b></div><button className="primary wide" type="submit">Confirmar pedido de demonstração</button><p className="fine-print">Não há cobrança nem envio real. Este fluxo é apenas uma demonstração visual.</p></form></div></div>}
     {success&&<div className="overlay" onClick={()=>setSuccess(false)}><div className="modal success-modal" onClick={e=>e.stopPropagation()}><button className="close" onClick={()=>setSuccess(false)}>×</button><div className="success-icon">✓</div><small className="eyebrow">Demonstração</small><h2>Pedido montado!</h2><p>Este pedido é fictício e não foi enviado à loja. Na versão final, a loja receberá os dados no painel e poderá acompanhar a entrega.</p><button className="primary wide" onClick={()=>setSuccess(false)}>Voltar ao cardápio</button></div></div>}
-    {editing && <div className="overlay" onClick={()=>setEditing(null)}><form className="modal edit-modal" onClick={e=>e.stopPropagation()} onSubmit={saveProduct}><button type="button" className="close" onClick={()=>setEditing(null)}>×</button><small className="eyebrow">Área da loja · demonstração</small><h2>{editing.id?'Editar produto':'Novo produto'}</h2><label>Nome<input name="name" required defaultValue={editing.name}/></label><label>Categoria<select name="category" defaultValue={editing.category||'Hambúrgueres'}>{['Promoções','Hambúrgueres','Acompanhamentos','Combos','Bebidas'].map(x=><option>{x}</option>)}</select></label><label>Preço (R$)<input name="price" type="number" min="0" step="0.01" required defaultValue={editing.price}/></label><label>Descrição<textarea name="description" defaultValue={editing.description}/></label><button className="primary wide">Salvar produto</button></form></div>}
+    {editing && <div className="overlay" onClick={()=>setEditing(null)}><form className="modal edit-modal" onClick={e=>e.stopPropagation()} onSubmit={saveProduct}><button type="button" className="close" onClick={()=>setEditing(null)}>×</button><small className="eyebrow">Área da loja</small><h2>{editing.id?'Editar produto':'Novo produto'}</h2><label>Nome<input name="name" required defaultValue={editing.name}/></label><label>Categoria<select name="category" defaultValue={editing.category||'Hambúrgueres'}>{['Promoções','Hambúrgueres','Acompanhamentos','Combos','Bebidas'].map(x=><option>{x}</option>)}</select></label><label>Preço (R$)<input name="price" type="number" min="0" step="0.01" required defaultValue={editing.price}/></label><label>URL da imagem<input name="image" type="url" defaultValue={editing.image}/></label><label>Descrição<textarea name="description" defaultValue={editing.description}/></label><button className="primary wide">Salvar produto</button></form></div>}
+    {showAdminLogin && <div className="overlay" onClick={()=>setShowAdminLogin(false)}><form className="modal edit-modal" onClick={e=>e.stopPropagation()} onSubmit={signInAdmin}><button type="button" className="close" onClick={()=>setShowAdminLogin(false)}>×</button><small className="eyebrow">Área restrita</small><h2>Entrar na área da loja</h2><p className="login-help">Acesse com o usuário administrador cadastrado no Supabase.</p><label>E-mail<input name="email" type="email" autoComplete="username" required/></label><label>Senha<input name="password" type="password" autoComplete="current-password" required/></label><button className="primary wide">Entrar</button></form></div>}
     {toast&&<div className="toast">✓ {toast}</div>}
   </>;
 }
 
-function Admin({products,setProducts,tab,setTab,back,orders,onEdit,onNew}) {
+function Admin({products,tab,setTab,back,orders,onEdit,onNew,onToggle,adminUser,onLogout,dataMode}) {
   const tabs=['Visão geral','Pedidos e entregas','Produtos','Relatórios'];
   const [selectedOrders,setSelectedOrders]=useState(orders.map(o=>o.id));
   const routeUrl='https://www.google.com/maps/dir/'+orders.filter(o=>selectedOrders.includes(o.id)).map(o=>encodeURIComponent(o.address.replace(/ · .*/,', Porto Alegre, RS'))).join('/');
   const toggle = id=>setSelectedOrders(a=>a.includes(id)?a.filter(x=>x!==id):[...a,id]);
-  return <main className="admin-page"><div className="admin-header"><div><div className="eyebrow">Painel da loja · demonstração</div><h1>Nask <span>Burguer</span></h1></div><div className="admin-head-actions"><button className="secondary" onClick={back}>← Voltar ao cardápio</button><button className="secondary">⚙ Configurações</button></div></div><nav className="admin-tabs">{tabs.map(t=><button className={tab===t?'active':''} onClick={()=>setTab(t)}>{t}</button>)}</nav>
+  return <main className="admin-page"><div className="admin-header"><div><div className="eyebrow">Painel da loja · {dataMode==='supabase'?'conectado ao Supabase':'modo demonstração local'}</div><h1>Nask <span>Burguer</span></h1></div><div className="admin-head-actions"><button className="secondary" onClick={back}>← Voltar ao cardápio</button>{adminUser&&<button className="secondary" onClick={onLogout}>Sair</button>}<button className="secondary">⚙ Configurações</button></div></div><nav className="admin-tabs">{tabs.map(t=><button className={tab===t?'active':''} onClick={()=>setTab(t)}>{t}</button>)}</nav>
     {tab==='Visão geral'&&<><div className="admin-subtitle"><h2>Resumo da operação</h2><span>Dados fictícios para demonstração</span></div><div className="stat-grid"><Stat label="Vendas hoje" value="R$ 1.284,50" note="↑ 12% vs. ontem"/><Stat label="Pedidos recebidos" value="32" note="8 aguardando preparo"/><Stat label="Ticket médio" value="R$ 40,14" note="↑ R$ 3,20 neste mês"/><Stat label="Em entrega" value="3" note="Endereços fictícios"/></div><AdminOrders orders={orders}/><AdminMap orders={orders} selected={selectedOrders} toggle={toggle} routeUrl={routeUrl}/></>}
     {tab==='Pedidos e entregas'&&<><div className="admin-subtitle"><h2>Pedidos e entregas</h2><span>Selecione os endereços para montar uma rota</span></div><AdminOrders orders={orders}/><AdminMap orders={orders} selected={selectedOrders} toggle={toggle} routeUrl={routeUrl}/></>}
-    {tab==='Produtos'&&<><div className="admin-subtitle"><div><h2>Produtos do cardápio</h2><span>Cadastre, edite ou pause itens neste navegador</span></div><button className="primary" onClick={onNew}>＋ Novo produto</button></div><div className="admin-products">{products.map(p=><div className="admin-product" key={p.id}><img src={p.image}/><div><b>{p.name}</b><small>{p.category} · {money(p.price)} · {p.active?'Ativo':'Pausado'}</small></div><button className="secondary" onClick={()=>onEdit(p)}>Editar</button><button className="secondary" onClick={()=>setProducts(a=>a.map(x=>x.id===p.id?{...x,active:!x.active}:x))}>{p.active?'Pausar':'Ativar'}</button></div>)}</div></>}
+    {tab==='Produtos'&&<><div className="admin-subtitle"><div><h2>Produtos do cardápio</h2><span>{dataMode==='supabase'?'As alterações serão salvas no Supabase':'As alterações ficam neste navegador'}</span></div><button className="primary" onClick={onNew}>＋ Novo produto</button></div><div className="admin-products">{products.map(p=><div className="admin-product" key={p.id}><img src={p.image}/><div><b>{p.name}</b><small>{p.category} · {money(p.price)} · {p.active?'Ativo':'Pausado'}</small></div><button className="secondary" onClick={()=>onEdit(p)}>Editar</button><button className="secondary" onClick={()=>onToggle(p)}>{p.active?'Pausar':'Ativar'}</button></div>)}</div></>}
     {tab==='Relatórios'&&<><div className="admin-subtitle"><h2>Relatórios demonstrativos</h2><span>Valores ilustrativos</span></div><div className="stat-grid"><Stat label="Faturamento no mês" value="R$ 28.940" note="Período demonstrativo"/><Stat label="Total de pedidos" value="718" note="Pedidos de teste"/><Stat label="Mais vendido" value="QuarterNask" note="146 unidades"/><Stat label="Vendas via Pix" value="64%" note="Distribuição ilustrativa"/></div><div className="report-card"><h3>Vendas por dia da semana</h3><div className="bars">{[['SEG',45],['TER',68],['QUA',54],['QUI',77],['SEX',88],['SÁB',100],['DOM',61]].map(([d,v])=><div><span style={{height:v+'%'}}></span><small>{d}</small></div>)}</div><p>Gráfico visual com dados fictícios para apresentar o painel.</p></div><div className="report-card products-report"><h3>Resumo de produtos</h3>{[['QuarterNask',146],['Ragu',121],['Batata Nask',98],['Refrigerante lata',83],['Outros itens',270]].map(([n,v])=><div><span>{n}</span><b>{v} un.</b><i style={{width:Math.min(v/2.7,100)+'%'}}/></div>)}</div></>}
     <p className="demo-note">Este painel é um protótipo visual. Pedidos, faturamento, endereços e gráficos não são reais.</p>
   </main>;
